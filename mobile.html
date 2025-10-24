@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Live MCQ OMR Scanner</title>
+<style>
+  body { font-family: system-ui, -apple-system, Roboto, Arial; margin:0; padding:0; background:#f4f7fb; color:#111827; }
+  header { background:#1f6feb; color:white; padding:1rem 2rem; display:flex; justify-content:space-between; align-items:center; }
+  header h1 { margin:0; font-size:1.3rem; }
+  .container { max-width:900px; background:white; margin:2rem auto; padding:2rem; border-radius:12px; box-shadow:0 6px 20px rgba(0,0,0,0.05); }
+  h2 { border-bottom:2px solid #e5e7eb; padding-bottom:4px; }
+  label { font-weight:600; margin-top:12px; display:block; }
+  input, select { width:100%; padding:8px; margin-top:4px; border:1px solid #cbd5e1; border-radius:6px; }
+  button { background:#1f6feb; color:white; padding:10px 14px; border:none; border-radius:6px; cursor:pointer; font-weight:600; margin-top:10px; }
+  button:hover { background:#155ab6; }
+  .answers select { width:60px; text-transform:uppercase; text-align:center; margin-right:6px; margin-bottom:6px; }
+  .row { display:flex; gap:6px; align-items:center; margin-bottom:6px; flex-wrap:wrap; }
+  #results { margin-top:20px; background:#f9fafb; padding:10px; border-radius:8px; }
+  .score { font-weight:bold; color:#1f6feb; }
+  video { width: 100%; border-radius:10px; margin-top:10px; }
+  canvas { display:none; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Live MCQ OMR Scanner</h1>
+</header>
+
+<div class="container">
+<h2>Student Information</h2>
+<label>Student Name:</label><input type="text" id="studentName" placeholder="Enter name">
+<label>Class:</label><input type="text" id="studentClass" placeholder="e.g., IX">
+<label>Section:</label><input type="text" id="studentSection" placeholder="e.g., A">
+
+<h2>Answer Key Setup</h2>
+<label>Number of Questions:</label><input type="number" id="numQuestions" min="1" max="100" value="5">
+<button id="generateBtn">Generate Answer Inputs</button>
+<div id="answerInputs" class="answers"></div>
+
+<h2>Live OMR Scan</h2>
+<video id="video" autoplay playsinline></video>
+
+<div id="results"></div>
+<button id="downloadBtn" style="display:none;">Download Results (CSV)</button>
+
+<canvas id="omrCanvas"></canvas>
+
+<script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+<script>
+let correctAnswers=[], studentData={};
+const video = document.getElementById('video');
+const omrCanvas = document.getElementById('omrCanvas');
+const ctx = omrCanvas.getContext('2d');
+const resultsDiv = document.getElementById('results');
+const downloadBtn = document.getElementById('downloadBtn');
+
+const generateBtn = document.getElementById('generateBtn');
+const answerInputs = document.getElementById('answerInputs');
+generateBtn.addEventListener('click', () => {
+  const n = parseInt(document.getElementById('numQuestions').value);
+  answerInputs.innerHTML='';
+  for(let i=1;i<=n;i++){
+    const row=document.createElement('div');
+    row.className='row';
+    row.innerHTML=`<label>Q${i}:</label>
+      <select id="ans${i}">
+        <option value="">Select</option>
+        <option value="A">A</option>
+        <option value="B">B</option>
+        <option value="C">C</option>
+        <option value="D">D</option>
+      </select>`;
+    answerInputs.appendChild(row);
+  }
+});
+
+// --- Access rear camera ---
+navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"}})
+.then(stream=>{video.srcObject=stream;})
+.catch(err=>{alert("Camera access required: "+err);});
+
+// --- OMR detection ---
+function detectOMRAnswersFromCanvas(canvas,numQuestions){
+  const src=cv.imread(canvas);
+  const gray=new cv.Mat(),blur=new cv.Mat(),thresh=new cv.Mat();
+  cv.cvtColor(src,gray,cv.COLOR_RGBA2GRAY);
+  cv.GaussianBlur(gray,blur,new cv.Size(5,5),0);
+  cv.adaptiveThreshold(blur,thresh,255,cv.ADAPTIVE_THRESH_GAUSSIAN_C,cv.THRESH_BINARY_INV,31,10);
+  const contours=new cv.MatVector(),hierarchy=new cv.Mat();
+  cv.findContours(thresh,contours,hierarchy,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
+  let bubbles=[];
+  for(let i=0;i<contours.size();i++){
+    const cnt=contours.get(i);
+    const rect=cv.boundingRect(cnt);
+    const aspect=rect.width/rect.height;
+    const area=rect.width*rect.height;
+    if(aspect>0.7&&aspect<1.3&&area>200&&area<2000) bubbles.push({x:rect.x+rect.width/2,y:rect.y+rect.height/2,rect});
+    cnt.delete();
+  }
+  bubbles.sort((a,b)=>a.y-b.y);
+  const grouped=[], yThreshold=20;
+  for(const b of bubbles){
+    let found=false;
+    for(const g of grouped){
+      if(Math.abs(g[0].y-b.y)<yThreshold){g.push(b);found=true;break;}
+    }
+    if(!found) grouped.push([b]);
+  }
+  grouped.forEach(row=>row.sort((a,b)=>a.x-b.x));
+  const answers=[], rows=Math.min(numQuestions,grouped.length);
+  for(let i=0;i<rows;i++){
+    const row=grouped[i], shades=[];
+    for(let j=0;j<row.length;j++){
+      const r=row[j].rect, roi=thresh.roi(r);
+      const filled=cv.countNonZero(roi);
+      shades.push({idx:j,fill:filled/(r.width*r.height)});
+      roi.delete();
+    }
+    const maxFill=Math.max(...shades.map(s=>s.fill));
+    const marked=shades.filter(s=>s.fill>maxFill*0.8);
+    if(marked.length===0) answers.push('None');
+    else if(marked.length>1) answers.push('Multiple');
+    else answers.push(['A','B','C','D'][marked[0].idx]||'?');
+  }
+  src.delete(); gray.delete(); blur.delete(); thresh.delete(); contours.delete(); hierarchy.delete();
+  return answers;
+}
+
+// --- Live scanning loop ---
+function liveScan(){
+  const n=parseInt(document.getElementById('numQuestions').value);
+  correctAnswers=[];
+  for(let i=1;i<=n;i++){
+    const val=document.getElementById('ans'+i).value;
+    if(!val.match(/^[A-D]$/)){ alert('Select valid answers for all questions.'); return; }
+    correctAnswers.push(val);
+  }
+  const studentName=document.getElementById('studentName').value.trim();
+  const studentClass=document.getElementById('studentClass').value.trim();
+  const studentSection=document.getElementById('studentSection').value.trim();
+  if(!studentName||!studentClass||!studentSection){ alert('Fill student info.'); return; }
+  studentData={name:studentName,class:studentClass,section:studentSection};
+
+  function processFrame(){
+    omrCanvas.width=video.videoWidth; omrCanvas.height=video.videoHeight;
+    ctx.drawImage(video,0,0,omrCanvas.width,omrCanvas.height);
+    const detected=detectOMRAnswersFromCanvas(omrCanvas,n);
+    let correctCount=0, details=[];
+    for(let i=0;i<n;i++){
+      let studentAns=detected[i], status='❌', displayAns=studentAns;
+      if(studentAns==='None') displayAns='No mark';
+      else if(studentAns==='Multiple') displayAns='Double mark';
+      else if(studentAns===correctAnswers[i]){status='✅'; correctCount++;}
+      details.push(`<tr><td>${i+1}</td><td>${displayAns}</td><td>${correctAnswers[i]}</td><td>${status}</td></tr>`);
+    }
+    resultsDiv.innerHTML=`<h3>Results for ${studentData.name}</h3>
+      <table border="1" cellspacing="0" cellpadding="6">
+      <tr><th>Q#</th><th>Student</th><th>Correct</th><th>Status</th></tr>${details.join('')}
+      </table>
+      <p class="score">Total Score: ${correctCount} / ${n}</p>`;
+    requestAnimationFrame(processFrame);
+  }
+  processFrame();
+}
+
+// --- Start live scan button ---
+const liveBtn=document.createElement('button');
+liveBtn.textContent='Start Live Scan';
+liveBtn.style.marginTop='10px';
+answerInputs.after(liveBtn);
+liveBtn.addEventListener('click',liveScan);
+
+// --- CSV download ---
+downloadBtn.addEventListener('click',()=>{
+  const n=parseInt(document.getElementById('numQuestions').value);
+  const detected=detectOMRAnswersFromCanvas(omrCanvas,n);
+  const csvData=[
+    ['Name','Class','Section','Total','Out of'],
+    [studentData.name,studentData.class,studentData.section,resultsDiv.querySelector('.score').textContent.split('/')[0],n],
+    [],
+    ['Q#','Student Answer','Correct Answer','Status']
+  ];
+  for(let i=0;i<n;i++) csvData.push([i+1,detected[i],correctAnswers[i],detected[i]===correctAnswers[i]?'Correct':'Wrong']);
+  const csv=csvData.map(r=>r.join(',')).join('\n');
+  const blob=new Blob([csv],{type:'text/csv'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url;
+  a.download=`${studentData.name}_result.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+});
+</script>
+
+</body>
+</html>
